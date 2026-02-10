@@ -1,980 +1,796 @@
-// gitText - WASM-powered text editor with syntax highlighting
-// Features: LZSS compression, AES-256 encryption, QR code, IndexedDB, syntax highlighting
+/**
+ * gitText - Secure WASM Editor with Supabase Sessions
+ * Security: CSP-ready, no eval, sanitized HTML, constant-time compare
+ */
 
-let wasm = null;
-let wasmMemory = null;
-let memoryView = null;
-let isEncrypted = false;
-let db = null;
-let currentDocId = null;
-let storageMode = 'url';
-let currentLanguage = 0;
-let highlightEnabled = true;
-let highlightTimeout = null;
+'use strict';
 
-const DB_NAME = 'gittext-db';
-const DB_VERSION = 1;
-const STORE_NAME = 'documents';
-const URL_SIZE_LIMIT = 32000;
+// Constants
+const ENCODER = new TextEncoder();
+const DECODER = new TextDecoder();
+const DB_CONFIG = { name: 'gt', ver: 1, store: 'd' };
+const URL_LIMIT = 32000;
 const TOKEN_SIZE = 9;
-
-// Token types (must match Zig)
-const TokenType = {
-    keyword: 1,
-    string: 2,
-    number: 3,
-    comment: 4,
-    operator: 5,
-    punctuation: 6,
-    function_name: 7,
-    type_name: 8,
-    variable: 9,
-    tag: 10,
-    attribute: 11,
-    property: 12,
+const LANGS = ['Plain','JavaScript','JSON','HTML','CSS','Python','Markdown','Zig'];
+const SUPABASE_URL = 'https://aszsbjmhnnecvokbezaa.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_QxCN7rqj58WYyZxywRE9Mw_I4fcGsdM';
+const TOKEN_CLASSES = {
+    1: 'kw', 2: 'str', 3: 'num', 4: 'cmt',
+    5: 'op', 6: 'punc', 7: 'fn', 8: 'type',
+    10: 'tag', 11: 'attr', 12: 'prop'
 };
 
-// Language types
-const Language = {
-    plain: 0,
-    javascript: 1,
-    json: 2,
-    html: 3,
-    css: 4,
-    python: 5,
-    markdown: 6,
-    zig: 7,
-};
+// State
+let wasm, memory, memView, db, supabase, sessionKey, syncInterval;
+let currentLang = 0, storageMode = 'url', password = null, docId = null;
+let saveTimeout, highlightTimeout;
 
-const LanguageNames = ['Plain', 'JavaScript', 'JSON', 'HTML', 'CSS', 'Python', 'Markdown', 'Zig'];
-
+// DOM Cache
 const dom = {};
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+const getEl = id => document.getElementById(id);
+[
+    'editor','editor-wrapper','highlight-layer','line-numbers','loading',
+    'copy-btn','clear-btn','encrypt-btn','qr-btn','docs-btn','download-btn','lang-btn','session-btn',
+    'stats','status-dot','status-text','url-size','toast',
+    'modal','modal-content','modal-close','modal-title',
+    'password-form','password-input','password-confirm','password-submit',
+    'qr-canvas','docs-list','storage-mode'
+].forEach(id => { const el = getEl(id); if (el) dom[id.replace(/-/g, '_')] = el; });
 
-let saveTimeout = null;
-let currentPassword = null;
+// Secure random key generation
+const genKey = () => {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const arr = new Uint8Array(16);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, b => chars[b % chars.length]).join('');
+};
 
-function initDom() {
-    const ids = [
-        'editor', 'editor-wrapper', 'highlight-layer', 'line-numbers', 'loading',
-        'copy-btn', 'clear-btn', 'encrypt-btn', 'qr-btn', 'docs-btn', 'download-btn', 'lang-btn',
-        'stats', 'status-dot', 'status-text', 'url-size', 'toast',
-        'modal', 'modal-content', 'modal-close', 'modal-title',
-        'password-form', 'password-input', 'password-confirm', 'password-submit',
-        'qr-canvas', 'docs-list', 'storage-mode'
-    ];
-    ids.forEach(id => {
-        dom[id.replace(/-/g, '_')] = document.getElementById(id);
-    });
-}
+// Constant-time string compare (security)
+const secureCompare = (a, b) => {
+    if (a.length !== b.length) return false;
+    let result = 0;
+    for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return result === 0;
+};
 
-function initDB() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => { db = request.result; resolve(db); };
-        request.onupgradeneeded = (e) => {
-            const database = e.target.result;
-            if (!database.objectStoreNames.contains(STORE_NAME)) {
-                const store = database.createObjectStore(STORE_NAME, { keyPath: 'id' });
-                store.createIndex('created', 'created', { unique: false });
-                store.createIndex('title', 'title', { unique: false });
+// Sanitize HTML (security)
+const escapeHtml = (() => {
+    const div = document.createElement('div');
+    return str => {
+        div.textContent = str;
+        return div.innerHTML;
+    };
+})();
+
+// WASM Memory Management
+const updateMemView = () => { memView = new Uint8Array(memory.buffer); };
+
+const toWasm = bytes => {
+    const ptr = wasm.alloc(bytes.length);
+    if (!ptr) throw new Error('Alloc failed');
+    if (memView.buffer !== memory.buffer) updateMemView();
+    memView.set(bytes, ptr);
+    return { ptr, len: bytes.length };
+};
+
+const fromWasm = packed => {
+    const ptr = Number(packed >> 32n);
+    const len = Number(packed & 0xFFFFFFFFn);
+    if (!ptr || !len) return null;
+    if (memView.buffer !== memory.buffer) updateMemView();
+    return memView.subarray(ptr, ptr + len);
+};
+
+const resetHeap = () => wasm.reset_heap();
+
+// WASM Operations
+const wasmOps = {
+    compress: data => { resetHeap(); return fromWasm(wasm.compress(...Object.values(toWasm(data))))?.slice(); },
+    decompress: data => { resetHeap(); return fromWasm(wasm.decompress(...Object.values(toWasm(data))))?.slice(); },
+    b64enc: data => { resetHeap(); const r = fromWasm(wasm.base64url_encode(...Object.values(toWasm(data)))); return r ? DECODER.decode(r) : ''; },
+    b64dec: str => { resetHeap(); return fromWasm(wasm.base64url_decode(...Object.values(toWasm(ENCODER.encode(str)))))?.slice(); },
+    encrypt: (data, pw) => {
+        resetHeap();
+        const seed = crypto.getRandomValues(new Uint8Array(16));
+        const nonce = fromWasm(wasm.generate_nonce(...Object.values(toWasm(seed))));
+        if (!nonce) return null;
+        const r = wasm.aes_ctr_encrypt(
+            ...Object.values(toWasm(data)),
+            ...Object.values(toWasm(ENCODER.encode(pw))),
+            ...Object.values(toWasm(nonce))
+        );
+        return fromWasm(r)?.slice();
+    },
+    decrypt: (data, pw) => {
+        resetHeap();
+        const r = wasm.aes_ctr_decrypt(
+            ...Object.values(toWasm(data)),
+            ...Object.values(toWasm(ENCODER.encode(pw)))
+        );
+        return fromWasm(r)?.slice();
+    },
+    tokenize: (text, langId) => {
+        if (!text || !langId) return [];
+        resetHeap();
+        const td = fromWasm(wasm.tokenize(...Object.values(toWasm(ENCODER.encode(text))), langId));
+        if (!td) return [];
+        const view = new DataView(td.buffer, td.byteOffset, td.byteLength);
+        const toks = [];
+        for (let i = 0; i + TOKEN_SIZE <= td.length; i += TOKEN_SIZE) {
+            toks.push({
+                s: view.getUint32(i, true),
+                l: view.getUint32(i + 4, true),
+                t: td[i + 8]
+            });
+        }
+        return toks;
+    },
+    qrGen: url => {
+        resetHeap();
+        const r = wasm.generate_qr(...Object.values(toWasm(ENCODER.encode(url))));
+        const ptr = Number(r >> 32n);
+        const sz = Number((r >> 16n) & 0xFFFFn);
+        return ptr ? { data: memView.subarray(ptr, ptr + sz * sz), sz } : null;
+    },
+    hash: data => {
+        resetHeap();
+        const r = fromWasm(wasm.hash_data(...Object.values(toWasm(data))));
+        return r ? DECODER.decode(r) : null;
+    },
+    detectLang: text => {
+        resetHeap();
+        return wasm.detect_language(...Object.values(toWasm(ENCODER.encode(text.slice(0, 2000)))));
+    }
+};
+
+// IndexedDB
+const idb = {
+    init: () => new Promise((res, rej) => {
+        const req = indexedDB.open(DB_CONFIG.name, DB_CONFIG.ver);
+        req.onerror = () => rej(req.error);
+        req.onsuccess = () => res(req.result);
+        req.onupgradeneeded = e => {
+            const d = e.target.result;
+            if (!d.objectStoreNames.contains(DB_CONFIG.store)) {
+                const s = d.createObjectStore(DB_CONFIG.store, { keyPath: 'id' });
+                s.createIndex('c', 'created', { unique: false });
             }
         };
-    });
-}
+    }),
+    save: (text, pw) => new Promise(async (res, rej) => {
+        if (!db) return res(null);
+        try {
+            let data = ENCODER.encode(text);
+            if (pw) data = wasmOps.encrypt(data, pw);
+            const compressed = wasmOps.compress(data);
+            if (!compressed) return res(null);
+            const id = wasmOps.hash(compressed);
+            if (!id) return res(null);
+            const doc = {
+                id,
+                title: text.split('\n')[0].slice(0, 50) || 'Untitled',
+                data: compressed,
+                enc: !!pw,
+                size: text.length,
+                created: Date.now()
+            };
+            const tx = db.transaction(DB_CONFIG.store, 'readwrite');
+            const r = tx.objectStore(DB_CONFIG.store).put(doc);
+            r.onsuccess = () => res(id);
+            r.onerror = () => rej(r.error);
+        } catch (e) { rej(e); }
+    }),
+    load: (id, pw) => new Promise((res, rej) => {
+        if (!db) return res(null);
+        const tx = db.transaction(DB_CONFIG.store, 'readonly');
+        const r = tx.objectStore(DB_CONFIG.store).get(id);
+        r.onsuccess = () => {
+            const doc = r.result;
+            if (!doc) return res(null);
+            let data = wasmOps.decompress(doc.data);
+            if (!data) return res(null);
+            if (doc.enc) {
+                if (!pw) return res({ needPw: true, doc });
+                data = wasmOps.decrypt(data, pw);
+                if (!data) return res({ badPw: true });
+            }
+            res({ text: DECODER.decode(data), doc });
+        };
+        r.onerror = () => rej(r.error);
+    }),
+    all: () => new Promise((res, rej) => {
+        if (!db) return res([]);
+        const tx = db.transaction(DB_CONFIG.store, 'readonly');
+        const r = tx.objectStore(DB_CONFIG.store).index('c').openCursor(null, 'prev');
+        const docs = [];
+        r.onsuccess = e => {
+            const c = e.target.result;
+            if (c) {
+                docs.push({ id: c.value.id, title: c.value.title, size: c.value.size, enc: c.value.enc, created: c.value.created });
+                c.continue();
+            } else res(docs);
+        };
+        r.onerror = () => rej(r.error);
+    }),
+    del: id => new Promise((res, rej) => {
+        if (!db) return res(false);
+        const tx = db.transaction(DB_CONFIG.store, 'readwrite');
+        const r = tx.objectStore(DB_CONFIG.store).delete(id);
+        r.onsuccess = () => res(true);
+        r.onerror = () => rej(r.error);
+    })
+};
 
-async function initWasm() {
+// URL Encoding
+const urlEnc = (text, pw) => {
+    let data = ENCODER.encode(text);
+    if (pw) data = wasmOps.encrypt(data, pw);
+    return (pw ? 'e' : '') + wasmOps.b64enc(wasmOps.compress(data));
+};
+
+const urlDec = (str, pw) => {
+    const isEnc = str[0] === 'e';
+    if (isEnc) str = str.slice(1);
+    const raw = wasmOps.b64dec(str);
+    if (!raw) return null;
+    let data = wasmOps.decompress(raw);
+    if (!data) return null;
+    if (isEnc) {
+        if (!pw) return { needPw: true };
+        data = wasmOps.decrypt(data, pw);
+        if (!data) return { badPw: true };
+    }
+    return DECODER.decode(data);
+};
+
+// Supabase Sessions
+const session = {
+    create: async pw => {
+        if (!supabase) return ui.toast('Supabase not ready');
+        const key = genKey();
+        const text = dom.editor.value;
+        if (!text) return ui.toast('Nothing to share');
+        try {
+            let data = ENCODER.encode(text);
+            if (pw) data = wasmOps.encrypt(data, pw);
+            const compressed = wasmOps.compress(data);
+            if (!compressed) return ui.toast('Compression failed');
+            const payload = {
+                k: key,
+                d: wasmOps.b64enc(compressed),
+                e: !!pw,
+                u: new Date().toISOString()
+            };
+            const { error } = await supabase.from('sessions').upsert(payload);
+            if (error) throw error;
+            sessionKey = key;
+            if (pw) password = pw;
+            const url = new URL(location.href);
+            url.searchParams.set('s', key);
+            history.replaceState(null, '', url);
+            session.startSync();
+            ui.updateSession(true);
+            ui.toast(`Session: ${key}`);
+        } catch (e) { console.error(e); ui.toast('Failed to create session'); }
+    },
+    join: async (key, pw) => {
+        if (!supabase) return ui.toast('Supabase not ready');
+        try {
+            const { data, error } = await supabase.from('sessions').select('d,e').eq('k', key).single();
+            if (error || !data) return ui.toast('Session not found');
+            const raw = wasmOps.b64dec(data.d);
+            if (!raw) return ui.toast('Decode failed');
+            let decrypted = wasmOps.decompress(raw);
+            if (!decrypted) return ui.toast('Decompress failed');
+            if (data.e) {
+                if (!pw) return ui.showSessionPw(key);
+                decrypted = wasmOps.decrypt(decrypted, pw);
+                if (!decrypted) return ui.toast('Wrong password');
+            }
+            dom.editor.value = DECODER.decode(decrypted);
+            sessionKey = key;
+            if (pw) password = pw;
+            const url = new URL(location.href);
+            url.searchParams.set('s', key);
+            history.replaceState(null, '', url);
+            ui.updateAll();
+            session.startSync();
+            ui.updateSession(true);
+            ui.toast(`Joined: ${key}`);
+        } catch (e) { console.error(e); ui.toast('Failed to join session'); }
+    },
+    syncUp: async () => {
+        if (!sessionKey || !supabase) return;
+        const text = dom.editor.value;
+        if (!text) return;
+        try {
+            let data = ENCODER.encode(text);
+            if (password) data = wasmOps.encrypt(data, password);
+            await supabase.from('sessions').upsert({
+                k: sessionKey,
+                d: wasmOps.b64enc(wasmOps.compress(data)),
+                e: !!password,
+                u: new Date().toISOString()
+            });
+            ui.setStatus('saved');
+        } catch (e) { console.error(e); }
+    },
+    syncDown: async () => {
+        if (!sessionKey || !supabase) return;
+        try {
+            const { data } = await supabase.from('sessions').select('d,e').eq('k', sessionKey).single();
+            if (!data) return;
+            const raw = wasmOps.b64dec(data.d);
+            if (!raw) return;
+            let decrypted = wasmOps.decompress(raw);
+            if (!decrypted) return;
+            if (data.e) {
+                if (!password) return; // Can't decrypt without password
+                decrypted = wasmOps.decrypt(decrypted, password);
+                if (!decrypted) return;
+            }
+            const text = DECODER.decode(decrypted);
+            if (text !== dom.editor.value) {
+                dom.editor.value = text;
+                ui.updateAll();
+                ui.toast('Session updated');
+            }
+        } catch (e) { console.error(e); }
+    },
+    startSync: () => {
+        if (syncInterval) clearInterval(syncInterval);
+        syncInterval = setInterval(session.syncDown, 5000);
+    },
+    stop: () => {
+        if (syncInterval) clearInterval(syncInterval);
+        syncInterval = null;
+        sessionKey = null;
+        ui.updateSession(false);
+        const url = new URL(location.href);
+        url.searchParams.delete('s');
+        history.replaceState(null, '', url);
+    }
+};
+
+// UI Helpers
+const ui = {
+    toast: msg => {
+        dom.toast.textContent = msg;
+        dom.toast.classList.add('show');
+        setTimeout(() => dom.toast.classList.remove('show'), 2000);
+    },
+    setStatus: s => {
+        dom.status_dot.classList.toggle('saving', s === 'saving');
+        dom.status_text.textContent = s === 'saving' ? 'Saving...' : s === 'saved' ? (password ? 'ENCRYPTED' : 'SAVED') : 'READY';
+    },
+    closeModal: () => {
+        dom.modal.classList.remove('show');
+        dom.qr_canvas.style.display = 'none';
+        dom.password_form.style.display = 'block';
+        dom.docs_list.style.display = 'none';
+        dom.docs_list.innerHTML = '';
+    },
+    updateStats: () => {
+        const text = dom.editor.value;
+        const chars = text.length;
+        const bytes = ENCODER.encode(text).length;
+        const lines = text.split('\n').length;
+        dom.stats.textContent = `${lines}L | ${chars}C | ${ui.fmtBytes(bytes)}`;
+    },
+    fmtBytes: b => b < 1024 ? `${b}B` : b < 1048576 ? `${(b/1024).toFixed(1)}K` : `${(b/1048576).toFixed(2)}M`,
+    updateLines: () => {
+        const n = dom.editor.value.split('\n').length;
+        dom.line_numbers.textContent = Array.from({length: n}, (_,i) => i + 1).join('\n');
+    },
+    syncScroll: () => {
+        const st = dom.editor.scrollTop;
+        dom.line_numbers.scrollTop = st;
+        dom.highlight_layer.scrollTop = st;
+        dom.highlight_layer.scrollLeft = dom.editor.scrollLeft;
+    },
+    updateAll: () => { ui.updateStats(); ui.updateLines(); ui.highlight(); },
+    updateSession: on => {
+        if (dom.session_btn) {
+            dom.session_btn.textContent = on ? 'LEAVE' : 'SESSION';
+            dom.session_btn.classList.toggle('active', on);
+        }
+        dom.storage_mode.textContent = on ? '[CLOUD]' : (storageMode === 'local' ? '[LOCAL]' : '[URL]');
+    },
+    getExt: () => ['txt','js','json','html','css','py','md','zig'][currentLang],
+    highlight: () => {
+        if (!dom.highlight_layer) return;
+        const text = dom.editor.value;
+        if (!text) return dom.highlight_layer.innerHTML = '<br>';
+        if (!currentLang) {
+            currentLang = wasmOps.detectLang(text);
+            dom.lang_btn.textContent = LANGS[currentLang];
+        }
+        if (!currentLang) return dom.highlight_layer.textContent = text;
+        const toks = wasmOps.tokenize(text, currentLang);
+        if (!toks.length) return dom.highlight_layer.textContent = text;
+        let html = '', lastEnd = 0;
+        for (const tk of toks) {
+            if (tk.s > lastEnd) html += escapeHtml(text.slice(lastEnd, tk.s));
+            const cls = TOKEN_CLASSES[tk.t];
+            const content = escapeHtml(text.slice(tk.s, tk.s + tk.l));
+            html += cls ? `<span class="tok-${cls}">${content}</span>` : content;
+            lastEnd = tk.s + tk.l;
+        }
+        if (lastEnd < text.length) html += escapeHtml(text.slice(lastEnd));
+        dom.highlight_layer.innerHTML = html || '<br>';
+    },
+    scheduleHighlight: () => {
+        if (highlightTimeout) cancelAnimationFrame(highlightTimeout);
+        highlightTimeout = requestAnimationFrame(ui.highlight);
+    },
+    showPassword: (mode, id = null) => {
+        const isDec = mode.includes('decrypt');
+        dom.modal_title.textContent = isDec ? 'DECRYPT' : 'ENCRYPT';
+        dom.password_form.style.display = 'block';
+        dom.docs_list.style.display = 'none';
+        dom.qr_canvas.style.display = 'none';
+        dom.modal.classList.add('show');
+        dom.password_input.value = '';
+        dom.password_confirm.style.display = isDec ? 'none' : 'block';
+        dom.password_confirm.value = '';
+        dom.password_submit.textContent = isDec ? 'DECRYPT' : 'ENCRYPT';
+        dom.password_submit.onclick = async () => {
+            const pw = dom.password_input.value;
+            if (!pw) return;
+            if (isDec) {
+                if (mode === 'decrypt-local' && id) {
+                    const r = await idb.load(id, pw);
+                    if (r?.badPw) return ui.toast('Wrong password');
+                    if (r?.text) {
+                        password = pw;
+                        dom.editor.value = r.text;
+                        dom.encrypt_btn.textContent = 'ENCRYPTED';
+                        dom.encrypt_btn.classList.add('active');
+                        ui.updateAll();
+                        ui.closeModal();
+                    }
+                } else {
+                    const t = urlDec(location.hash.slice(1), pw);
+                    if (t?.badPw) return ui.toast('Wrong password');
+                    if (typeof t === 'string') {
+                        password = pw;
+                        dom.editor.value = t;
+                        dom.encrypt_btn.textContent = 'ENCRYPTED';
+                        dom.encrypt_btn.classList.add('active');
+                        ui.updateAll();
+                        ui.closeModal();
+                    }
+                }
+            } else {
+                if (!secureCompare(pw, dom.password_confirm.value)) return ui.toast('Passwords do not match');
+                password = pw;
+                dom.encrypt_btn.textContent = 'ENCRYPTED';
+                dom.encrypt_btn.classList.add('active');
+                if (mode === 'sess-enc-create') {
+                    session.create(pw);
+                } else {
+                    doc.save();
+                }
+                ui.closeModal();
+                ui.toast('Encrypted');
+            }
+        };
+    },
+    showSessionPw: key => {
+        dom.modal_title.textContent = 'SESSION PASSWORD';
+        dom.password_form.style.display = 'block';
+        dom.docs_list.style.display = 'none';
+        dom.qr_canvas.style.display = 'none';
+        dom.modal.classList.add('show');
+        dom.password_input.value = '';
+        dom.password_confirm.style.display = 'none';
+        dom.password_submit.textContent = 'JOIN';
+        dom.password_submit.onclick = () => {
+            session.join(key, dom.password_input.value);
+            ui.closeModal();
+        };
+    },
+    showSessionDlg: () => {
+        if (sessionKey) { session.stop(); ui.toast('Left session'); return; }
+        dom.modal_title.textContent = 'SESSION';
+        dom.password_form.style.display = 'none';
+        dom.docs_list.style.display = 'block';
+        dom.docs_list.innerHTML = `
+            <div class="download-options">
+                <button class="download-option" id="sc"><span class="download-icon">[NEW]</span><span>CREATE</span></button>
+                <button class="download-option" id="se"><span class="download-icon">[ENC]</span><span>ENCRYPTED</span></button>
+                <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border)">
+                    <input id="ski" placeholder="ENTER_KEY" style="width:100%;padding:.75rem;background:var(--bg-dark);border:1px solid var(--border);border-radius:6px;color:var(--text);margin-bottom:.5rem;font-family:monospace">
+                    <button class="download-option" id="sj" style="width:100%"><span class="download-icon">[JOIN]</span><span>JOIN</span></button>
+                </div>
+            </div>`;
+        dom.modal.classList.add('show');
+        getEl('sc').onclick = () => { ui.closeModal(); session.create(); };
+        getEl('se').onclick = () => {
+            ui.closeModal();
+            ui.showPassword('sess-enc-create');
+        };
+        getEl('sj').onclick = () => {
+            const k = getEl('ski').value.trim();
+            if (k) { ui.closeModal(); session.join(k); }
+        };
+    },
+    showDocs: async () => {
+        dom.modal_title.textContent = 'DOCUMENTS';
+        dom.password_form.style.display = 'none';
+        dom.docs_list.style.display = 'block';
+        dom.docs_list.innerHTML = '<div class="loading-docs">...</div>';
+        dom.modal.classList.add('show');
+        try {
+            const docs = await idb.all();
+            if (!docs.length) return dom.docs_list.innerHTML = '<div class="no-docs">NO DOCUMENTS</div>';
+            dom.docs_list.innerHTML = docs.map(d => `
+                <div class="doc-item" data-id="${escapeHtml(d.id)}">
+                    <div class="doc-info">
+                        <span class="doc-title">${escapeHtml(d.title)}</span>
+                        <span class="doc-meta">${ui.fmtBytes(d.size)} ${d.enc ? '[ENC]' : ''}</span>
+                    </div>
+                    <div class="doc-actions">
+                        <button class="doc-load" data-id="${escapeHtml(d.id)}">OPEN</button>
+                        <button class="doc-delete" data-id="${escapeHtml(d.id)}">DEL</button>
+                    </div>
+                </div>`).join('');
+            dom.docs_list.querySelectorAll('.doc-load').forEach(b => b.onclick = () => {
+                ui.closeModal();
+                history.pushState(null, '', location.pathname + '#d:' + b.dataset.id);
+                doc.load();
+            });
+            dom.docs_list.querySelectorAll('.doc-delete').forEach(b => b.onclick = async () => {
+                if (confirm('Delete?')) {
+                    await idb.del(b.dataset.id);
+                    b.closest('.doc-item').remove();
+                    if (docId === b.dataset.id) doc.clear();
+                    ui.toast('Deleted');
+                }
+            });
+        } catch (e) { dom.docs_list.innerHTML = '<div class="error">ERROR</div>'; }
+    },
+    showDL: () => {
+        dom.modal_title.textContent = 'DOWNLOAD';
+        dom.password_form.style.display = 'none';
+        dom.docs_list.style.display = 'block';
+        dom.docs_list.innerHTML = `
+            <div class="download-options">
+                <button class="download-option" data-f="txt"><span class="download-icon">[TXT]</span><span>.${ui.getExt()}</span></button>
+                <button class="download-option" data-f="lzss"><span class="download-icon">[LZSS]</span><span>.lzss</span></button>
+            </div>`;
+        dom.docs_list.querySelectorAll('.download-option').forEach(b => b.onclick = () => {
+            const text = dom.editor.value;
+            if (!text) return ui.toast('Empty');
+            const a = document.createElement('a');
+            const ts = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+            if (b.dataset.f === 'lzss') {
+                const c = wasmOps.compress(ENCODER.encode(text));
+                if (!c) return ui.toast('Failed');
+                a.href = URL.createObjectURL(new Blob([c]));
+                a.download = `gt_${ts}.lzss`;
+            } else {
+                a.href = URL.createObjectURL(new Blob([text]));
+                a.download = `gt_${ts}.${ui.getExt()}`;
+            }
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            ui.closeModal();
+            ui.toast('Downloaded');
+        });
+        dom.modal.classList.add('show');
+    },
+    showQR: () => {
+        const url = location.href;
+        if (url.length > 2000) return ui.toast('URL too long');
+        const q = wasmOps.qrGen(url);
+        if (!q) return ui.toast('Failed');
+        dom.qr_canvas.style.display = 'block';
+        dom.qr_canvas.width = dom.qr_canvas.height = (q.sz + 8) * 6;
+        const ctx = dom.qr_canvas.getContext('2d');
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, dom.qr_canvas.width, dom.qr_canvas.height);
+        ctx.fillStyle = '#0f0';
+        for (let y = 0; y < q.sz; y++) {
+            for (let x = 0; x < q.sz; x++) {
+                if (q.data[y * q.sz + x]) ctx.fillRect((x + 4) * 6, (y + 4) * 6, 6, 6);
+            }
+        }
+        dom.modal_title.textContent = 'QR CODE';
+        dom.password_form.style.display = 'none';
+        dom.docs_list.style.display = 'none';
+        dom.modal.classList.add('show');
+    }
+};
+
+// Document Operations
+const doc = {
+    save: async () => {
+        const text = dom.editor.value;
+        if (!text) {
+            history.replaceState(null, '', location.pathname);
+            docId = null;
+            storageMode = 'url';
+            dom.storage_mode.textContent = '[URL]';
+            dom.url_size.textContent = '0B';
+            return;
+        }
+        ui.setStatus('saving');
+        try {
+            const encoded = urlEnc(text, password);
+            if (encoded.length < URL_LIMIT) {
+                storageMode = 'url';
+                docId = null;
+                history.replaceState(null, '', location.pathname + '#' + encoded);
+                dom.url_size.textContent = ui.fmtBytes(encoded.length);
+            } else {
+                storageMode = 'local';
+                const id = await idb.save(text, password);
+                if (id) {
+                    docId = id;
+                    history.replaceState(null, '', location.pathname + '#d:' + id);
+                    dom.url_size.textContent = ui.fmtBytes(id.length + 2);
+                }
+            }
+            dom.storage_mode.textContent = storageMode === 'local' ? '[LOCAL]' : '[URL]';
+            ui.setStatus('saved');
+            if (sessionKey) session.syncUp();
+        } catch (e) { console.error(e); ui.setStatus('error'); }
+    },
+    load: async () => {
+        const hash = location.hash.slice(1);
+        if (!hash) return;
+        if (hash.startsWith('d:')) {
+            const id = hash.slice(2);
+            docId = id;
+            storageMode = 'local';
+            const r = await idb.load(id);
+            if (!r) return ui.toast('Not found');
+            if (r.needPw) return ui.showPassword('decrypt-local', id);
+            dom.editor.value = r.text;
+            password = r.doc.enc ? password : null;
+            dom.storage_mode.textContent = '[LOCAL]';
+            dom.url_size.textContent = ui.fmtBytes(id.length + 2);
+            ui.updateAll();
+            return;
+        }
+        storageMode = 'url';
+        if (hash[0] === 'e') return ui.showPassword('decrypt');
+        try {
+            const t = urlDec(hash);
+            if (typeof t === 'string' && t) {
+                dom.editor.value = t;
+                dom.url_size.textContent = ui.fmtBytes(hash.length);
+                ui.updateAll();
+            }
+        } catch (e) { console.error(e); }
+        dom.storage_mode.textContent = '[URL]';
+    },
+    clear: () => {
+        dom.editor.value = '';
+        password = null;
+        docId = null;
+        storageMode = 'url';
+        currentLang = 0;
+        history.replaceState(null, '', location.pathname);
+        ui.updateAll();
+        dom.encrypt_btn.textContent = 'ENCRYPT';
+        dom.encrypt_btn.classList.remove('active');
+        dom.highlight_layer.innerHTML = '<br>';
+        ui.setStatus('ready');
+        dom.editor.focus();
+    }
+};
+
+// Actions
+const actions = {
+    copy: async () => {
+        try {
+            await navigator.clipboard.writeText(location.href);
+            ui.toast('Copied');
+        } catch {
+            const t = document.createElement('textarea');
+            t.value = location.href;
+            t.style.cssText = 'position:fixed;opacity:0';
+            document.body.appendChild(t);
+            t.select();
+            document.execCommand('copy');
+            document.body.removeChild(t);
+            ui.toast('Copied');
+        }
+    },
+    toggleEnc: () => {
+        if (password) {
+            password = null;
+            dom.encrypt_btn.textContent = 'ENCRYPT';
+            dom.encrypt_btn.classList.remove('active');
+            doc.save();
+            ui.toast('Decrypted');
+        } else ui.showPassword('encrypt');
+    },
+    cycleLang: () => {
+        currentLang = (currentLang + 1) % LANGS.length;
+        dom.lang_btn.textContent = LANGS[currentLang];
+        ui.scheduleHighlight();
+    }
+};
+
+// Initialization
+const init = async () => {
     try {
-        await Promise.all([
-            fetch('editor.wasm').then(r => r.arrayBuffer()).then(bytes =>
-                WebAssembly.instantiate(bytes, { env: {} })
-            ).then(module => {
-                wasm = module.instance.exports;
-                wasmMemory = wasm.memory;
-                updateMemoryView();
-            }),
-            initDB().catch(e => console.warn('IndexedDB unavailable:', e))
+        supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+        const [wasmResult] = await Promise.all([
+            fetch('editor.wasm')
+                .then(r => r.arrayBuffer())
+                .then(b => WebAssembly.instantiate(b, { env: {} }))
+                .then(m => {
+                    wasm = m.instance.exports;
+                    memory = wasm.memory;
+                    updateMemView();
+                }),
+            idb.init().then(d => db = d).catch(e => console.warn('IDB:', e))
         ]);
 
         dom.loading.style.display = 'none';
         dom.editor_wrapper.style.display = 'flex';
-        dom.copy_btn.disabled = false;
-        dom.encrypt_btn.disabled = false;
-        dom.qr_btn.disabled = false;
-        dom.docs_btn.disabled = false;
-        dom.download_btn.disabled = false;
-        dom.lang_btn.disabled = false;
+        ['copy_btn','clear_btn','encrypt_btn','qr_btn','docs_btn','download_btn','lang_btn','session_btn']
+            .forEach(b => dom[b] && (dom[b].disabled = false));
 
-        await loadFromUrl();
-        setupEventListeners();
-        updateStats();
-        updateLineNumbers();
-        scheduleHighlight();
-    } catch (error) {
-        console.error('Failed to load WASM:', error);
-        dom.loading.textContent = 'Failed to load editor. Please refresh.';
-    }
-}
+        await doc.load();
 
-function updateMemoryView() {
-    memoryView = new Uint8Array(wasmMemory.buffer);
-}
-
-function writeToWasm(bytes) {
-    const ptr = wasm.alloc(bytes.length);
-    if (!ptr) throw new Error('Failed to allocate WASM memory');
-    if (memoryView.buffer !== wasmMemory.buffer) updateMemoryView();
-    memoryView.set(bytes, ptr);
-    return { ptr, len: bytes.length };
-}
-
-function readFromWasm(packed) {
-    const ptr = Number(packed >> 32n);
-    const len = Number(packed & 0xFFFFFFFFn);
-    if (ptr === 0 || len === 0) return null;
-    if (memoryView.buffer !== wasmMemory.buffer) updateMemoryView();
-    return memoryView.subarray(ptr, ptr + len);
-}
-
-// ============================================================================
-// SYNTAX HIGHLIGHTING
-// ============================================================================
-
-function detectLanguage(text) {
-    if (!text || text.length < 10) return Language.plain;
-    
-    wasm.reset_heap();
-    const bytes = textEncoder.encode(text.slice(0, 2000));
-    const { ptr, len } = writeToWasm(bytes);
-    return wasm.detect_language(ptr, len);
-}
-
-function tokenize(text, lang) {
-    if (!text || lang === Language.plain) return [];
-    
-    wasm.reset_heap();
-    const bytes = textEncoder.encode(text);
-    const { ptr, len } = writeToWasm(bytes);
-    const result = wasm.tokenize(ptr, len, lang);
-    const tokenData = readFromWasm(result);
-    
-    if (!tokenData) return [];
-    
-    const tokens = [];
-    const view = new DataView(tokenData.buffer, tokenData.byteOffset, tokenData.byteLength);
-    
-    for (let i = 0; i + TOKEN_SIZE <= tokenData.length; i += TOKEN_SIZE) {
-        const start = view.getUint32(i, true);
-        const length = view.getUint32(i + 4, true);
-        const type = tokenData[i + 8];
-        tokens.push({ start, length, type });
-    }
-    
-    return tokens;
-}
-
-function getTokenClass(type) {
-    switch (type) {
-        case TokenType.keyword: return 'tok-kw';
-        case TokenType.string: return 'tok-str';
-        case TokenType.number: return 'tok-num';
-        case TokenType.comment: return 'tok-cmt';
-        case TokenType.operator: return 'tok-op';
-        case TokenType.punctuation: return 'tok-punc';
-        case TokenType.function_name: return 'tok-fn';
-        case TokenType.type_name: return 'tok-type';
-        case TokenType.tag: return 'tok-tag';
-        case TokenType.attribute: return 'tok-attr';
-        case TokenType.property: return 'tok-prop';
-        default: return '';
-    }
-}
-
-function highlightCode() {
-    if (!highlightEnabled || !dom.highlight_layer) return;
-    
-    const text = dom.editor.value;
-    if (!text) {
-        dom.highlight_layer.innerHTML = '<br>';
-        return;
-    }
-    
-    // Auto-detect language if not set
-    if (currentLanguage === Language.plain) {
-        currentLanguage = detectLanguage(text);
-        updateLanguageButton();
-    }
-    
-    if (currentLanguage === Language.plain) {
-        dom.highlight_layer.textContent = text;
-        return;
-    }
-    
-    const tokens = tokenize(text, currentLanguage);
-    
-    if (tokens.length === 0) {
-        dom.highlight_layer.textContent = text;
-        return;
-    }
-    
-    // Build highlighted HTML
-    let html = '';
-    let lastEnd = 0;
-    
-    for (const token of tokens) {
-        // Add text before token
-        if (token.start > lastEnd) {
-            html += escapeHtml(text.slice(lastEnd, token.start));
-        }
-        
-        // Add token with class
-        const tokenText = text.slice(token.start, token.start + token.length);
-        const cls = getTokenClass(token.type);
-        if (cls) {
-            html += `<span class="${cls}">${escapeHtml(tokenText)}</span>`;
-        } else {
-            html += escapeHtml(tokenText);
-        }
-        
-        lastEnd = token.start + token.length;
-    }
-    
-    // Add remaining text
-    if (lastEnd < text.length) {
-        html += escapeHtml(text.slice(lastEnd));
-    }
-    
-    dom.highlight_layer.innerHTML = html || '<br>';
-}
-
-function scheduleHighlight() {
-    if (highlightTimeout) cancelAnimationFrame(highlightTimeout);
-    highlightTimeout = requestAnimationFrame(highlightCode);
-}
-
-function escapeHtml(str) {
-    return str
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
-// ============================================================================
-// LINE NUMBERS
-// ============================================================================
-
-function updateLineNumbers() {
-    const text = dom.editor.value;
-    const lines = text.split('\n').length;
-    
-    let html = '';
-    for (let i = 1; i <= lines; i++) {
-        html += i + '\n';
-    }
-    
-    dom.line_numbers.textContent = html;
-}
-
-function syncScroll() {
-    const scrollTop = dom.editor.scrollTop;
-    const scrollLeft = dom.editor.scrollLeft;
-    
-    dom.line_numbers.scrollTop = scrollTop;
-    dom.highlight_layer.scrollTop = scrollTop;
-    dom.highlight_layer.scrollLeft = scrollLeft;
-}
-
-// ============================================================================
-// DOWNLOAD
-// ============================================================================
-
-function downloadFile(format = 'txt') {
-    const text = dom.editor.value;
-    if (!text) {
-        showToast('Nothing to download');
-        return;
-    }
-    
-    let blob, filename;
-    const timestamp = new Date().toISOString().slice(0, 10);
-    
-    if (format === 'compressed') {
-        const compressed = compressData(textEncoder.encode(text));
-        if (compressed) {
-            blob = new Blob([compressed], { type: 'application/octet-stream' });
-            filename = `gittext-${timestamp}.lzss`;
-        } else {
-            showToast('Compression failed');
-            return;
-        }
-    } else {
-        const ext = getFileExtension();
-        blob = new Blob([text], { type: 'text/plain' });
-        filename = `gittext-${timestamp}.${ext}`;
-    }
-    
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-    
-    showToast(`Downloaded: ${filename}`);
-}
-
-function getFileExtension() {
-    switch (currentLanguage) {
-        case Language.javascript: return 'js';
-        case Language.json: return 'json';
-        case Language.html: return 'html';
-        case Language.css: return 'css';
-        case Language.python: return 'py';
-        case Language.markdown: return 'md';
-        case Language.zig: return 'zig';
-        default: return 'txt';
-    }
-}
-
-function showDownloadMenu() {
-    dom.modal_title.textContent = 'Download';
-    dom.password_form.style.display = 'none';
-    dom.qr_canvas.style.display = 'none';
-    dom.docs_list.style.display = 'block';
-    
-    const ext = getFileExtension();
-    dom.docs_list.innerHTML = `
-        <div class="download-options">
-            <button class="download-option" data-format="txt">
-                <span class="download-icon">📄</span>
-                <span>Text File (.${ext})</span>
-            </button>
-            <button class="download-option" data-format="compressed">
-                <span class="download-icon">📦</span>
-                <span>Compressed (.lzss)</span>
-            </button>
-        </div>
-    `;
-    
-    dom.docs_list.querySelectorAll('.download-option').forEach(btn => {
-        btn.onclick = () => {
-            downloadFile(btn.dataset.format);
-            closeModal();
+        // Event Listeners
+        dom.editor.addEventListener('input', () => { ui.updateAll(); doc.save(); });
+        dom.editor.addEventListener('scroll', ui.syncScroll);
+        dom.copy_btn.onclick = actions.copy;
+        dom.clear_btn.onclick = doc.clear;
+        dom.encrypt_btn.onclick = actions.toggleEnc;
+        dom.qr_btn.onclick = ui.showQR;
+        dom.docs_btn.onclick = ui.showDocs;
+        dom.download_btn.onclick = ui.showDL;
+        dom.lang_btn.onclick = actions.cycleLang;
+        if (dom.session_btn) dom.session_btn.onclick = ui.showSessionDlg;
+        dom.modal_close.onclick = ui.closeModal;
+        dom.modal.onclick = e => { if (e.target === dom.modal) ui.closeModal(); };
+        dom.password_input.onkeydown = dom.password_confirm.onkeydown = e => {
+            if (e.key === 'Enter') dom.password_submit.click();
         };
-    });
-    
-    dom.modal.classList.add('show');
-}
-
-// ============================================================================
-// LANGUAGE SELECTION
-// ============================================================================
-
-function cycleLanguage() {
-    currentLanguage = (currentLanguage + 1) % LanguageNames.length;
-    updateLanguageButton();
-    scheduleHighlight();
-}
-
-function updateLanguageButton() {
-    dom.lang_btn.textContent = LanguageNames[currentLanguage];
-}
-
-// ============================================================================
-// COMPRESSION & ENCRYPTION (unchanged)
-// ============================================================================
-
-function generateShareCode(data) {
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(data);
-    const result = wasm.hash_data(ptr, len);
-    const code = readFromWasm(result);
-    return code ? textDecoder.decode(code) : null;
-}
-
-function compressData(data) {
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(data);
-    const result = wasm.compress(ptr, len);
-    const compressed = readFromWasm(result);
-    return compressed ? compressed.slice() : null;
-}
-
-function decompressData(data) {
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(data);
-    const result = wasm.decompress(ptr, len);
-    const decompressed = readFromWasm(result);
-    return decompressed ? decompressed.slice() : null;
-}
-
-function generateNonce() {
-    const seed = new Uint8Array(16);
-    const view = new DataView(seed.buffer);
-    view.setBigUint64(0, BigInt(Date.now()), true);
-    crypto.getRandomValues(seed.subarray(8));
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(seed);
-    const result = wasm.generate_nonce(ptr, len);
-    const nonce = readFromWasm(result);
-    return nonce ? nonce.slice() : null;
-}
-
-function encryptData(data, password) {
-    const nonce = generateNonce();
-    if (!nonce) return null;
-    wasm.reset_heap();
-    const { ptr: dataPtr, len: dataLen } = writeToWasm(data);
-    const { ptr: pwPtr, len: pwLen } = writeToWasm(textEncoder.encode(password));
-    const { ptr: noncePtr } = writeToWasm(nonce);
-    const result = wasm.aes_ctr_encrypt(dataPtr, dataLen, pwPtr, pwLen, noncePtr);
-    const encrypted = readFromWasm(result);
-    return encrypted ? encrypted.slice() : null;
-}
-
-function decryptData(data, password) {
-    wasm.reset_heap();
-    const { ptr: dataPtr, len: dataLen } = writeToWasm(data);
-    const { ptr: pwPtr, len: pwLen } = writeToWasm(textEncoder.encode(password));
-    const result = wasm.aes_ctr_decrypt(dataPtr, dataLen, pwPtr, pwLen);
-    const decrypted = readFromWasm(result);
-    return decrypted ? decrypted.slice() : null;
-}
-
-function base64UrlEncode(data) {
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(data);
-    const result = wasm.base64url_encode(ptr, len);
-    const encoded = readFromWasm(result);
-    return encoded ? textDecoder.decode(encoded) : '';
-}
-
-function base64UrlDecode(str) {
-    wasm.reset_heap();
-    const { ptr, len } = writeToWasm(textEncoder.encode(str));
-    const result = wasm.base64url_decode(ptr, len);
-    const decoded = readFromWasm(result);
-    return decoded ? decoded.slice() : null;
-}
-
-// ============================================================================
-// INDEXEDDB STORAGE
-// ============================================================================
-
-async function saveToIndexedDB(text, password = null) {
-    if (!db) return null;
-    let data = textEncoder.encode(text);
-    if (password) {
-        data = encryptData(data, password);
-        if (!data) return null;
-    }
-    const compressed = compressData(data);
-    if (!compressed) return null;
-    const id = generateShareCode(compressed);
-    if (!id) return null;
-    const firstLine = text.split('\n')[0].slice(0, 50) || 'Untitled';
-    const doc = {
-        id, title: firstLine, data: compressed, encrypted: !!password,
-        size: text.length, compressedSize: compressed.length,
-        created: Date.now(), modified: Date.now()
-    };
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.put(doc);
-        request.onsuccess = () => resolve(id);
-        request.onerror = () => reject(request.error);
-    });
-}
-
-async function loadFromIndexedDB(id, password = null) {
-    if (!db) return null;
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.get(id);
-        request.onsuccess = () => {
-            const doc = request.result;
-            if (!doc) { resolve(null); return; }
-            let data = decompressData(doc.data);
-            if (!data) { resolve(null); return; }
-            if (doc.encrypted) {
-                if (!password) { resolve({ needsPassword: true, doc }); return; }
-                data = decryptData(data, password);
-                if (!data) { resolve({ wrongPassword: true }); return; }
+        window.onpopstate = () => { doc.load(); ui.updateStats(); };
+        document.onkeydown = e => {
+            const mod = e.ctrlKey || e.metaKey;
+            if (mod && e.key === 's') {
+                e.preventDefault();
+                if (saveTimeout) clearTimeout(saveTimeout);
+                doc.save();
             }
-            resolve({ text: textDecoder.decode(data), doc });
+            if (mod && e.shiftKey && e.key === 'C') { e.preventDefault(); actions.copy(); }
+            if (e.key === 'Escape' && dom.modal.classList.contains('show')) ui.closeModal();
         };
-        request.onerror = () => reject(request.error);
-    });
-}
-
-async function getAllDocuments() {
-    if (!db) return [];
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const index = store.index('created');
-        const request = index.openCursor(null, 'prev');
-        const docs = [];
-        request.onsuccess = (e) => {
-            const cursor = e.target.result;
-            if (cursor) {
-                docs.push({
-                    id: cursor.value.id, title: cursor.value.title,
-                    size: cursor.value.size, encrypted: cursor.value.encrypted,
-                    created: cursor.value.created
-                });
-                cursor.continue();
-            } else resolve(docs);
-        };
-        request.onerror = () => reject(request.error);
-    });
-}
-
-async function deleteDocument(id) {
-    if (!db) return false;
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.delete(id);
-        request.onsuccess = () => resolve(true);
-        request.onerror = () => reject(request.error);
-    });
-}
-
-// ============================================================================
-// URL ENCODING
-// ============================================================================
-
-function encodeTextForUrl(text, password = null) {
-    if (!text) return '';
-    let data = textEncoder.encode(text);
-    if (password) {
-        data = encryptData(data, password);
-        if (!data) return '';
-    }
-    const compressed = compressData(data);
-    if (!compressed) return '';
-    const encoded = base64UrlEncode(compressed);
-    return (password ? 'e' : '') + encoded;
-}
-
-function decodeTextFromUrl(encoded, password = null) {
-    if (!encoded) return '';
-    const wasEncrypted = encoded.startsWith('e');
-    if (wasEncrypted) encoded = encoded.slice(1);
-    const decoded = base64UrlDecode(encoded);
-    if (!decoded) return '';
-    let data = decompressData(decoded);
-    if (!data) return '';
-    if (wasEncrypted) {
-        if (!password) return { needsPassword: true };
-        data = decryptData(data, password);
-        if (!data) return { wrongPassword: true };
-    }
-    return textDecoder.decode(data);
-}
-
-// ============================================================================
-// SAVE/LOAD
-// ============================================================================
-
-async function saveDocument() {
-    const text = dom.editor.value;
-    if (!text) {
-        history.replaceState(null, '', location.pathname);
-        currentDocId = null;
-        storageMode = 'url';
-        updateStorageModeDisplay();
-        updateUrlStats(0);
-        return;
-    }
-    setStatus('saving');
-    try {
-        const testEncoded = encodeTextForUrl(text, currentPassword);
-        if (testEncoded.length < URL_SIZE_LIMIT) {
-            storageMode = 'url';
-            currentDocId = null;
-            history.replaceState(null, '', `${location.pathname}#${testEncoded}`);
-            updateUrlStats(testEncoded.length);
-        } else {
-            storageMode = 'local';
-            const id = await saveToIndexedDB(text, currentPassword);
-            if (id) {
-                currentDocId = id;
-                history.replaceState(null, '', `${location.pathname}#d:${id}`);
-                updateUrlStats(id.length + 2);
-            }
-        }
-        updateStorageModeDisplay();
-        setStatus('saved');
-    } catch (error) {
-        console.error('Failed to save:', error);
-        setStatus('error');
-    }
-}
-
-async function loadFromUrl() {
-    const hash = location.hash.slice(1);
-    if (!hash) return;
-    if (hash.startsWith('d:')) {
-        const docId = hash.slice(2);
-        currentDocId = docId;
-        storageMode = 'local';
-        const result = await loadFromIndexedDB(docId);
-        if (!result) { showToast('Document not found'); return; }
-        if (result.needsPassword) {
-            isEncrypted = true;
-            showPasswordPrompt('decrypt-local', docId);
-            return;
-        }
-        dom.editor.value = result.text;
-        isEncrypted = result.doc.encrypted;
-        updateStorageModeDisplay();
-        updateUrlStats(docId.length + 2);
-        currentLanguage = Language.plain;
-        updateLineNumbers();
-        scheduleHighlight();
-        return;
-    }
-    storageMode = 'url';
-    const wasEncrypted = hash.startsWith('e');
-    if (wasEncrypted) {
-        isEncrypted = true;
-        showPasswordPrompt('decrypt');
-        return;
-    }
-    try {
-        const text = decodeTextFromUrl(hash);
-        if (typeof text === 'string' && text) {
-            dom.editor.value = text;
-            updateUrlStats(hash.length);
-            currentLanguage = Language.plain;
-            updateLineNumbers();
-            scheduleHighlight();
-        }
-    } catch (error) {
-        console.error('Failed to load from URL:', error);
-    }
-    updateStorageModeDisplay();
-}
-
-// ============================================================================
-// UI
-// ============================================================================
-
-function updateStats() {
-    const text = dom.editor.value;
-    const chars = text.length;
-    const bytes = textEncoder.encode(text).length;
-    const lines = text.split('\n').length;
-    dom.stats.textContent = `${lines} lines | ${chars.toLocaleString()} chars | ${formatBytes(bytes)}`;
-}
-
-function updateUrlStats(size) {
-    dom.url_size.textContent = `URL: ${formatBytes(size)}`;
-}
-
-function updateStorageModeDisplay() {
-    const mode = storageMode === 'local' ? 'Local' : 'URL';
-    const icon = storageMode === 'local' ? '💾' : '🔗';
-    dom.storage_mode.textContent = `${icon} ${mode}`;
-}
-
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-}
-
-function setStatus(status) {
-    const dot = dom.status_dot;
-    const text = dom.status_text;
-    switch (status) {
-        case 'saving': dot.classList.add('saving'); text.textContent = 'Saving...'; break;
-        case 'saved': dot.classList.remove('saving'); text.textContent = isEncrypted ? 'Encrypted' : 'Saved'; break;
-        case 'error': dot.classList.remove('saving'); text.textContent = 'Error'; break;
-        default: dot.classList.remove('saving'); text.textContent = 'Ready';
-    }
-}
-
-function showToast(message) {
-    dom.toast.textContent = message;
-    dom.toast.classList.add('show');
-    setTimeout(() => dom.toast.classList.remove('show'), 2000);
-}
-
-function closeModal() {
-    dom.modal.classList.remove('show');
-    dom.qr_canvas.style.display = 'none';
-    dom.password_form.style.display = 'block';
-    dom.docs_list.style.display = 'none';
-    dom.docs_list.innerHTML = '';
-}
-
-function showPasswordPrompt(mode, docId = null) {
-    dom.modal_title.textContent = mode.includes('decrypt') ? 'Enter Password' : 'Set Password';
-    dom.password_form.style.display = 'block';
-    dom.docs_list.style.display = 'none';
-    dom.qr_canvas.style.display = 'none';
-    dom.modal.classList.add('show');
-    dom.password_input.value = '';
-    dom.password_input.focus();
-    const isDecrypt = mode.includes('decrypt');
-    dom.password_confirm.style.display = isDecrypt ? 'none' : 'block';
-    dom.password_confirm.value = '';
-    dom.password_submit.textContent = isDecrypt ? 'Decrypt' : 'Encrypt';
-    dom.password_submit.onclick = async () => {
-        const password = dom.password_input.value;
-        if (!password) return;
-        if (isDecrypt) {
-            if (mode === 'decrypt-local' && docId) {
-                const result = await loadFromIndexedDB(docId, password);
-                if (result?.wrongPassword) { showToast('Wrong password!'); return; }
-                if (result?.text) {
-                    currentPassword = password;
-                    dom.editor.value = result.text;
-                    updateEncryptionUI(true);
-                    updateLineNumbers();
-                    scheduleHighlight();
-                    closeModal();
-                }
-            } else {
-                const hash = location.hash.slice(1);
-                const text = decodeTextFromUrl(hash, password);
-                if (text?.wrongPassword) { showToast('Wrong password!'); return; }
-                if (typeof text === 'string') {
-                    currentPassword = password;
-                    dom.editor.value = text;
-                    updateUrlStats(hash.length);
-                    updateEncryptionUI(true);
-                    updateLineNumbers();
-                    scheduleHighlight();
-                    closeModal();
-                }
-            }
-        } else {
-            const confirm = dom.password_confirm.value;
-            if (password !== confirm) { showToast('Passwords do not match'); return; }
-            currentPassword = password;
-            isEncrypted = true;
-            updateEncryptionUI(true);
-            saveDocument();
-            closeModal();
-            showToast('Encryption enabled!');
-        }
-    };
-}
-
-function updateEncryptionUI(encrypted) {
-    isEncrypted = encrypted;
-    dom.encrypt_btn.textContent = encrypted ? 'Encrypted' : 'Encrypt';
-    dom.encrypt_btn.classList.toggle('active', encrypted);
-}
-
-async function showDocumentsList() {
-    dom.modal_title.textContent = 'Saved Documents';
-    dom.password_form.style.display = 'none';
-    dom.qr_canvas.style.display = 'none';
-    dom.docs_list.style.display = 'block';
-    dom.docs_list.innerHTML = '<div class="loading-docs">Loading...</div>';
-    dom.modal.classList.add('show');
-    try {
-        const docs = await getAllDocuments();
-        if (docs.length === 0) {
-            dom.docs_list.innerHTML = '<div class="no-docs">No saved documents</div>';
-            return;
-        }
-        dom.docs_list.innerHTML = docs.map(doc => `
-            <div class="doc-item" data-id="${doc.id}">
-                <div class="doc-info">
-                    <span class="doc-title">${escapeHtml(doc.title)}</span>
-                    <span class="doc-meta">${formatBytes(doc.size)} ${doc.encrypted ? '🔒' : ''}</span>
-                </div>
-                <div class="doc-actions">
-                    <button class="doc-load" data-id="${doc.id}">Open</button>
-                    <button class="doc-delete" data-id="${doc.id}">Del</button>
-                </div>
-            </div>
-        `).join('');
-        dom.docs_list.querySelectorAll('.doc-load').forEach(btn => {
-            btn.onclick = () => {
-                closeModal();
-                history.pushState(null, '', `${location.pathname}#d:${btn.dataset.id}`);
-                loadFromUrl();
-            };
-        });
-        dom.docs_list.querySelectorAll('.doc-delete').forEach(btn => {
-            btn.onclick = async () => {
-                if (confirm('Delete this document?')) {
-                    await deleteDocument(btn.dataset.id);
-                    btn.closest('.doc-item').remove();
-                    if (currentDocId === btn.dataset.id) clearEditor();
-                    showToast('Document deleted');
-                }
-            };
-        });
-    } catch (error) {
-        dom.docs_list.innerHTML = '<div class="error">Failed to load documents</div>';
-    }
-}
-
-function showQrCode() {
-    const url = location.href;
-    if (url.length > 2000) { showToast('URL too long for QR code'); return; }
-    wasm.reset_heap();
-    const urlBytes = textEncoder.encode(url);
-    const { ptr, len } = writeToWasm(urlBytes);
-    const result = wasm.generate_qr(ptr, len);
-    if (result === 0n) { showToast('Failed to generate QR code'); return; }
-    const dataPtr = Number(result >> 32n);
-    const qrSize = Number((result >> 16n) & 0xFFFFn);
-    if (memoryView.buffer !== wasmMemory.buffer) updateMemoryView();
-    const qrData = memoryView.subarray(dataPtr, dataPtr + qrSize * qrSize);
-    const canvas = dom.qr_canvas;
-    const scale = 6, border = 4;
-    const size = (qrSize + border * 2) * scale;
-    canvas.width = size; canvas.height = size;
-    canvas.style.display = 'block';
-    const ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, size, size);
-    ctx.fillStyle = '#000000';
-    for (let y = 0; y < qrSize; y++) {
-        for (let x = 0; x < qrSize; x++) {
-            if (qrData[y * qrSize + x] === 1) {
-                ctx.fillRect((x + border) * scale, (y + border) * scale, scale, scale);
-            }
-        }
-    }
-    dom.modal_title.textContent = 'QR Code';
-    dom.password_form.style.display = 'none';
-    dom.docs_list.style.display = 'none';
-    dom.modal.classList.add('show');
-}
-
-async function copyLink() {
-    try {
-        await navigator.clipboard.writeText(location.href);
-        showToast('Link copied!');
-    } catch {
-        const ta = document.createElement('textarea');
-        ta.value = location.href;
-        ta.style.cssText = 'position:fixed;opacity:0';
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        showToast('Link copied!');
-    }
-}
-
-function clearEditor() {
-    dom.editor.value = '';
-    currentPassword = null;
-    currentDocId = null;
-    isEncrypted = false;
-    storageMode = 'url';
-    currentLanguage = Language.plain;
-    history.replaceState(null, '', location.pathname);
-    updateStats();
-    updateUrlStats(0);
-    updateEncryptionUI(false);
-    updateStorageModeDisplay();
-    updateLanguageButton();
-    updateLineNumbers();
-    dom.highlight_layer.innerHTML = '<br>';
-    setStatus('ready');
-    dom.editor.focus();
-}
-
-function toggleEncryption() {
-    if (isEncrypted) {
-        currentPassword = null;
-        isEncrypted = false;
-        updateEncryptionUI(false);
-        saveDocument();
-        showToast('Encryption disabled');
-    } else {
-        showPasswordPrompt('encrypt');
-    }
-}
-
-const scheduleSave = typeof requestIdleCallback === 'function'
-    ? () => { if (saveTimeout) cancelIdleCallback(saveTimeout); saveTimeout = requestIdleCallback(saveDocument, { timeout: 800 }); }
-    : () => { if (saveTimeout) clearTimeout(saveTimeout); saveTimeout = setTimeout(saveDocument, 800); };
-
-function setupEventListeners() {
-    dom.editor.addEventListener('input', () => {
-        updateStats();
-        updateLineNumbers();
-        scheduleHighlight();
-        scheduleSave();
-    });
-    
-    dom.editor.addEventListener('scroll', syncScroll);
-    
-    dom.copy_btn.addEventListener('click', copyLink);
-    dom.clear_btn.addEventListener('click', clearEditor);
-    dom.encrypt_btn.addEventListener('click', toggleEncryption);
-    dom.qr_btn.addEventListener('click', showQrCode);
-    dom.docs_btn.addEventListener('click', showDocumentsList);
-    dom.download_btn.addEventListener('click', showDownloadMenu);
-    dom.lang_btn.addEventListener('click', cycleLanguage);
-    dom.modal_close.addEventListener('click', closeModal);
-    dom.modal.addEventListener('click', (e) => { if (e.target === dom.modal) closeModal(); });
-    dom.password_input.addEventListener('keydown', (e) => { if (e.key === 'Enter') dom.password_submit.click(); });
-    dom.password_confirm.addEventListener('keydown', (e) => { if (e.key === 'Enter') dom.password_submit.click(); });
-    window.addEventListener('popstate', () => { loadFromUrl(); updateStats(); });
-    
-    document.addEventListener('keydown', (e) => {
-        const isMod = e.ctrlKey || e.metaKey;
-        if (isMod && e.key === 's') {
+        dom.editor.ondragover = e => { e.preventDefault(); dom.editor.classList.add('dragover'); };
+        dom.editor.ondragleave = () => dom.editor.classList.remove('dragover');
+        dom.editor.ondrop = async e => {
             e.preventDefault();
-            if (saveTimeout) typeof requestIdleCallback === 'function' ? cancelIdleCallback(saveTimeout) : clearTimeout(saveTimeout);
-            saveDocument();
-        }
-        if (isMod && e.shiftKey && e.key === 'C') { e.preventDefault(); copyLink(); }
-        if (e.key === 'Escape' && dom.modal.classList.contains('show')) closeModal();
-    });
-    
-    dom.editor.addEventListener('dragover', (e) => { e.preventDefault(); dom.editor.classList.add('dragover'); });
-    dom.editor.addEventListener('dragleave', () => { dom.editor.classList.remove('dragover'); });
-    dom.editor.addEventListener('drop', async (e) => {
-        e.preventDefault();
-        dom.editor.classList.remove('dragover');
-        const file = e.dataTransfer.files[0];
-        if (file) {
-            const text = await file.text();
-            dom.editor.value = text;
-            currentLanguage = detectLanguageFromFilename(file.name);
-            updateStats();
-            updateLineNumbers();
-            updateLanguageButton();
-            scheduleHighlight();
-            scheduleSave();
-            showToast(`Loaded: ${file.name}`);
-        }
-    });
-}
+            dom.editor.classList.remove('dragover');
+            const f = e.dataTransfer.files[0];
+            if (f) {
+                dom.editor.value = await f.text();
+                const ext = f.name.split('.').pop().toLowerCase();
+                currentLang = { js: 1, jsx: 1, ts: 1, tsx: 1, mjs: 1, json: 2, html: 3, htm: 3, css: 4, scss: 4, less: 4, py: 5, pyw: 5, md: 6, markdown: 6, zig: 7 }[ext] || 0;
+                dom.lang_btn.textContent = LANGS[currentLang];
+                ui.updateAll();
+                doc.save();
+                ui.toast(f.name);
+            }
+        };
 
-function detectLanguageFromFilename(filename) {
-    const ext = filename.split('.').pop().toLowerCase();
-    switch (ext) {
-        case 'js': case 'jsx': case 'ts': case 'tsx': case 'mjs': return Language.javascript;
-        case 'json': return Language.json;
-        case 'html': case 'htm': return Language.html;
-        case 'css': case 'scss': case 'less': return Language.css;
-        case 'py': case 'pyw': return Language.python;
-        case 'md': case 'markdown': return Language.markdown;
-        case 'zig': return Language.zig;
-        default: return Language.plain;
+        // Check for session in URL
+        const url = new URL(location.href);
+        const sKey = url.searchParams.get('s');
+        if (sKey) await session.join(sKey);
+
+    } catch (e) {
+        console.error(e);
+        dom.loading.textContent = 'ERROR LOADING';
     }
-}
+};
 
-initDom();
-initWasm();
+init();

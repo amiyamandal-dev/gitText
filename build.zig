@@ -21,9 +21,9 @@ pub fn build(b: *std.Build) void {
     exe.entry = .disabled;
     exe.rdynamic = true;
 
-    // Install to web directory
+    // Install to docs directory
     const install_step = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = "../web" } },
+        .dest_dir = .{ .override = .{ .custom = "../docs" } },
     });
 
     b.getInstallStep().dependOn(&install_step.step);

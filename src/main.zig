@@ -1175,6 +1175,116 @@ export fn get_heap_size() usize {
 }
 
 // ============================================================================
+// SESSION MANAGEMENT (12-hour expiry)
+// ============================================================================
+
+const SESSION_DURATION_SECS: u64 = 12 * 60 * 60; // 12 hours in seconds
+const SESSION_ID_LEN: usize = 16;
+
+// Session state
+var session_id: [SESSION_ID_LEN]u8 = [_]u8{0} ** SESSION_ID_LEN;
+var session_created_at: u64 = 0;
+var session_active: bool = false;
+
+// PRNG state for session ID generation
+var prng_state: u64 = 0x853c49e6748fea9b;
+
+fn prngNext() u64 {
+    prng_state ^= prng_state >> 12;
+    prng_state ^= prng_state << 25;
+    prng_state ^= prng_state >> 27;
+    return prng_state *% 0x2545F4914F6CDD1D;
+}
+
+// Create a new session - returns pointer to session ID
+// current_time_secs: Unix timestamp in seconds from JS
+export fn session_create(current_time_secs: u64, seed: u64) u64 {
+    // Seed the PRNG with time and provided seed
+    prng_state = current_time_secs ^ seed ^ 0x853c49e6748fea9b;
+    
+    // Generate session ID (base64url characters)
+    for (0..SESSION_ID_LEN) |i| {
+        const rand_val = prngNext();
+        session_id[i] = base64url_alphabet[@as(usize, @truncate(rand_val & 0x3F))];
+    }
+    
+    session_created_at = current_time_secs;
+    session_active = true;
+    
+    return (@as(u64, @intFromPtr(&session_id)) << 32) | SESSION_ID_LEN;
+}
+
+// Validate session - returns 1 if valid, 0 if expired/invalid
+// current_time_secs: Unix timestamp in seconds from JS
+export fn session_validate(current_time_secs: u64) u8 {
+    if (!session_active) return 0;
+    
+    const elapsed = current_time_secs -| session_created_at;
+    if (elapsed >= SESSION_DURATION_SECS) {
+        // Session expired - auto invalidate
+        session_active = false;
+        @memset(&session_id, 0);
+        session_created_at = 0;
+        return 0;
+    }
+    
+    return 1;
+}
+
+// Get remaining session time in seconds (0 if expired/invalid)
+export fn session_remaining(current_time_secs: u64) u64 {
+    if (!session_active) return 0;
+    
+    const elapsed = current_time_secs -| session_created_at;
+    if (elapsed >= SESSION_DURATION_SECS) {
+        return 0;
+    }
+    
+    return SESSION_DURATION_SECS - elapsed;
+}
+
+// Get session ID - returns pointer and length (0 if no active session)
+export fn session_get_id() u64 {
+    if (!session_active) return 0;
+    return (@as(u64, @intFromPtr(&session_id)) << 32) | SESSION_ID_LEN;
+}
+
+// Manually invalidate/destroy session
+export fn session_invalidate() void {
+    session_active = false;
+    @memset(&session_id, 0);
+    session_created_at = 0;
+}
+
+// Refresh session (extend expiry from current time)
+export fn session_refresh(current_time_secs: u64) u8 {
+    if (!session_active) return 0;
+    
+    // Only refresh if session is still valid
+    const elapsed = current_time_secs -| session_created_at;
+    if (elapsed >= SESSION_DURATION_SECS) {
+        session_active = false;
+        @memset(&session_id, 0);
+        session_created_at = 0;
+        return 0;
+    }
+    
+    // Extend session
+    session_created_at = current_time_secs;
+    return 1;
+}
+
+// Check if session is active (without time check)
+export fn session_is_active() u8 {
+    return if (session_active) 1 else 0;
+}
+
+// Get session creation timestamp
+export fn session_get_created_at() u64 {
+    return session_created_at;
+}
+
+// ============================================================================
 // SYNTAX HIGHLIGHTING LEXER
 // ============================================================================
 
