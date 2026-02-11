@@ -565,10 +565,12 @@ fn deriveKey(password: []const u8, salt: []const u8, key: *[32]u8) void {
             state[idx] = sbox[state[idx]];
             state[(idx + 1) % 32] ^= state[idx];
         }
-        // Diffusion
+        // Diffusion (use temp buffer to avoid in-place corruption)
+        var tmp: [32]u8 = undefined;
         for (0..32) |i| {
-            state[i] = state[i] ^ state[(i + 13) % 32] ^ state[(i + 23) % 32];
+            tmp[i] = state[i] ^ state[(i + 13) % 32] ^ state[(i + 23) % 32];
         }
+        state = tmp;
     }
     key.* = state;
 }
@@ -771,18 +773,18 @@ fn drawAlignment(cx: usize, cy: usize) void {
     }
 }
 
-// Alignment pattern positions
-const alignment_pos = [_][2]usize{
-    .{ 0, 0 }, // v1 - none
-    .{ 6, 18 }, // v2
-    .{ 6, 22 }, // v3
-    .{ 6, 26 }, // v4
-    .{ 6, 30 }, // v5
-    .{ 6, 34 }, // v6
-    .{ 6, 22 }, // v7 (simplified)
-    .{ 6, 24 }, // v8
-    .{ 6, 26 }, // v9
-    .{ 6, 28 }, // v10
+// Alignment pattern positions (full set per version)
+const alignment_pos = [_][]const usize{
+    &.{},                       // v1 - none
+    &.{ 6, 18 },                // v2
+    &.{ 6, 22 },                // v3
+    &.{ 6, 26 },                // v4
+    &.{ 6, 30 },                // v5
+    &.{ 6, 34 },                // v6
+    &.{ 6, 22, 38 },            // v7
+    &.{ 6, 24, 42 },            // v8
+    &.{ 6, 26, 46 },            // v9
+    &.{ 6, 28, 50 },            // v10
 };
 
 // Draw function patterns
@@ -799,10 +801,18 @@ fn drawFunctionPatterns(version: usize) void {
         setModule(6, i, v);
     }
 
-    // Alignment pattern (version >= 2)
+    // Alignment patterns (version >= 2)
     if (version >= 2) {
-        const pos = alignment_pos[version][1];
-        drawAlignment(pos, pos);
+        const positions = alignment_pos[version];
+        for (positions) |py| {
+            for (positions) |px| {
+                // Skip if overlapping with finder patterns
+                if (px <= 8 and py <= 8) continue;
+                if (px >= qr_size - 8 and py <= 8) continue;
+                if (px <= 8 and py >= qr_size - 8) continue;
+                drawAlignment(px, py);
+            }
+        }
     }
 
     // Dark module
@@ -1875,6 +1885,189 @@ fn tokenizeJSON(input: []const u8, output: []u8) usize {
     return idx;
 }
 
+// Tokenize Zig (proper keyword set + @builtin handling)
+fn tokenizeZig(input: []const u8, output: []u8) usize {
+    var idx: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < input.len and idx + TOKEN_SIZE <= output.len) {
+        const c = input[pos];
+
+        if (isWhitespace(c)) { pos += 1; continue; }
+
+        // Single-line comment
+        if (c == '/' and pos + 1 < input.len and input[pos + 1] == '/') {
+            const start = pos;
+            while (pos < input.len and input[pos] != '\n') pos += 1;
+            writeToken(output, &idx, start, pos - start, .comment);
+            continue;
+        }
+
+        // String / char literal
+        if (c == '"' or c == '\'') {
+            const quote = c;
+            const start = pos;
+            pos += 1;
+            while (pos < input.len) {
+                if (input[pos] == '\\' and pos + 1 < input.len) { pos += 2; }
+                else if (input[pos] == quote) { pos += 1; break; }
+                else if (input[pos] == '\n') break
+                else { pos += 1; }
+            }
+            writeToken(output, &idx, start, pos - start, .string);
+            continue;
+        }
+
+        // Number
+        if (isDigit(c) or (c == '.' and pos + 1 < input.len and isDigit(input[pos + 1]))) {
+            const start = pos;
+            if (c == '0' and pos + 1 < input.len and (input[pos + 1] == 'x' or input[pos + 1] == 'b' or input[pos + 1] == 'o')) {
+                pos += 2;
+                while (pos < input.len and (isHexDigit(input[pos]) or input[pos] == '_')) pos += 1;
+            } else {
+                while (pos < input.len and (isDigit(input[pos]) or input[pos] == '.' or input[pos] == '_')) pos += 1;
+                if (pos < input.len and (input[pos] == 'e' or input[pos] == 'E')) {
+                    pos += 1;
+                    if (pos < input.len and (input[pos] == '+' or input[pos] == '-')) pos += 1;
+                    while (pos < input.len and isDigit(input[pos])) pos += 1;
+                }
+            }
+            writeToken(output, &idx, start, pos - start, .number);
+            continue;
+        }
+
+        // @builtin calls
+        if (c == '@' and pos + 1 < input.len and isAlpha(input[pos + 1])) {
+            const start = pos;
+            pos += 1;
+            while (pos < input.len and isAlnum(input[pos])) pos += 1;
+            writeToken(output, &idx, start, pos - start, .function_name);
+            continue;
+        }
+
+        // Identifier/keyword
+        if (isAlpha(c)) {
+            const start = pos;
+            while (pos < input.len and isAlnum(input[pos])) pos += 1;
+            const word = input[start..pos];
+            if (isKeyword(word, .zig)) {
+                writeToken(output, &idx, start, pos - start, .keyword);
+            } else if (pos < input.len and input[pos] == '(') {
+                writeToken(output, &idx, start, pos - start, .function_name);
+            } else if (word.len > 0 and word[0] >= 'A' and word[0] <= 'Z') {
+                writeToken(output, &idx, start, pos - start, .type_name);
+            }
+            continue;
+        }
+
+        // Operators
+        if (c == '+' or c == '-' or c == '*' or c == '/' or c == '=' or c == '<' or c == '>' or
+            c == '!' or c == '&' or c == '|' or c == '^' or c == '%' or c == '~' or c == '?')
+        {
+            const start = pos;
+            pos += 1;
+            if (pos < input.len) {
+                const next = input[pos];
+                if ((c == '=' and next == '=') or (c == '!' and next == '=') or
+                    (c == '<' and (next == '=' or next == '<')) or
+                    (c == '>' and (next == '=' or next == '>')) or
+                    (c == '+' and next == '+') or (c == '*' and next == '*'))
+                { pos += 1; }
+            }
+            writeToken(output, &idx, start, pos - start, .operator);
+            continue;
+        }
+
+        // Punctuation
+        if (c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}' or
+            c == ',' or c == ';' or c == ':' or c == '.')
+        {
+            writeToken(output, &idx, pos, 1, .punctuation);
+            pos += 1;
+            continue;
+        }
+
+        pos += 1;
+    }
+    return idx;
+}
+
+// Tokenize Markdown (headings, bold, italic, code, links)
+fn tokenizeMarkdown(input: []const u8, output: []u8) usize {
+    var idx: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < input.len and idx + TOKEN_SIZE <= output.len) {
+        const c = input[pos];
+
+        // Headings: # at start of line
+        if (c == '#' and (pos == 0 or input[pos - 1] == '\n')) {
+            const start = pos;
+            while (pos < input.len and input[pos] == '#') pos += 1;
+            while (pos < input.len and input[pos] != '\n') pos += 1;
+            writeToken(output, &idx, start, pos - start, .keyword);
+            continue;
+        }
+
+        // Fenced code block ```
+        if (c == '`' and pos + 2 < input.len and input[pos + 1] == '`' and input[pos + 2] == '`') {
+            const start = pos;
+            pos += 3;
+            while (pos < input.len and input[pos] != '\n') pos += 1; // lang tag line
+            // Find closing ```
+            while (pos + 2 < input.len) {
+                if (input[pos] == '`' and input[pos + 1] == '`' and input[pos + 2] == '`') {
+                    pos += 3;
+                    break;
+                }
+                pos += 1;
+            }
+            writeToken(output, &idx, start, pos - start, .comment);
+            continue;
+        }
+
+        // Inline code `...`
+        if (c == '`') {
+            const start = pos;
+            pos += 1;
+            while (pos < input.len and input[pos] != '`' and input[pos] != '\n') pos += 1;
+            if (pos < input.len and input[pos] == '`') pos += 1;
+            writeToken(output, &idx, start, pos - start, .string);
+            continue;
+        }
+
+        // Bold **...**
+        if (c == '*' and pos + 1 < input.len and input[pos + 1] == '*') {
+            const start = pos;
+            pos += 2;
+            while (pos + 1 < input.len and !(input[pos] == '*' and input[pos + 1] == '*')) pos += 1;
+            if (pos + 1 < input.len) pos += 2;
+            writeToken(output, &idx, start, pos - start, .type_name);
+            continue;
+        }
+
+        // Link [text](url)
+        if (c == '[') {
+            const start = pos;
+            pos += 1;
+            while (pos < input.len and input[pos] != ']' and input[pos] != '\n') pos += 1;
+            if (pos < input.len and input[pos] == ']') {
+                pos += 1;
+                if (pos < input.len and input[pos] == '(') {
+                    pos += 1;
+                    while (pos < input.len and input[pos] != ')' and input[pos] != '\n') pos += 1;
+                    if (pos < input.len and input[pos] == ')') pos += 1;
+                }
+            }
+            writeToken(output, &idx, start, pos - start, .tag);
+            continue;
+        }
+
+        pos += 1;
+    }
+    return idx;
+}
+
 // Main tokenize function
 export fn tokenize(input_ptr: [*]const u8, input_len: usize, lang: u8) u64 {
     if (input_len == 0) return 0;
@@ -1891,7 +2084,8 @@ export fn tokenize(input_ptr: [*]const u8, input_len: usize, lang: u8) u64 {
         .html => tokenizeHTML(input, output),
         .css => tokenizeCSS(input, output),
         .python => tokenizePython(input, output),
-        .zig => tokenizeJS(input, output), // Zig is similar enough to JS
+        .zig => tokenizeZig(input, output),
+        .markdown => tokenizeMarkdown(input, output),
         else => 0,
     };
 

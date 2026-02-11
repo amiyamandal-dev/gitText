@@ -37,19 +37,28 @@ const getEl = id => document.getElementById(id);
     'qr-canvas','docs-list','storage-mode'
 ].forEach(id => { const el = getEl(id); if (el) dom[id.replace(/-/g, '_')] = el; });
 
-// Secure random key generation
+// Secure random key generation (rejection sampling to avoid modulo bias)
 const genKey = () => {
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    const arr = new Uint8Array(16);
-    crypto.getRandomValues(arr);
-    return Array.from(arr, b => chars[b % chars.length]).join('');
+    const limit = 256 - (256 % chars.length); // 256 - (256 % 62) = 252
+    const result = [];
+    while (result.length < 16) {
+        const arr = new Uint8Array(32);
+        crypto.getRandomValues(arr);
+        for (const b of arr) {
+            if (b < limit && result.length < 16) result.push(chars[b % chars.length]);
+        }
+    }
+    return result.join('');
 };
 
-// Constant-time string compare (security)
+// Constant-time string compare (security) — pad to max length to avoid length leak
 const secureCompare = (a, b) => {
-    if (a.length !== b.length) return false;
-    let result = 0;
-    for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    const len = Math.max(a.length, b.length);
+    let result = a.length ^ b.length; // non-zero if lengths differ
+    for (let i = 0; i < len; i++) {
+        result |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+    }
     return result === 0;
 };
 
@@ -91,9 +100,7 @@ const wasmOps = {
     b64dec: str => { resetHeap(); return fromWasm(wasm.base64url_decode(...Object.values(toWasm(ENCODER.encode(str)))))?.slice(); },
     encrypt: (data, pw) => {
         resetHeap();
-        const seed = crypto.getRandomValues(new Uint8Array(16));
-        const nonce = fromWasm(wasm.generate_nonce(...Object.values(toWasm(seed))));
-        if (!nonce) return null;
+        const nonce = crypto.getRandomValues(new Uint8Array(12)); // direct CSPRNG, no weak PRNG
         const r = wasm.aes_ctr_encrypt(
             ...Object.values(toWasm(data)),
             ...Object.values(toWasm(ENCODER.encode(pw))),
@@ -339,12 +346,23 @@ const session = {
     },
     startSync: () => {
         if (syncInterval) clearInterval(syncInterval);
-        syncInterval = setInterval(session.syncDown, 5000);
+        let backoff = 5000;
+        const sync = async () => {
+            try {
+                await session.syncDown();
+                backoff = 5000;
+            } catch {
+                backoff = Math.min(backoff * 2, 60000);
+            }
+            if (syncInterval) syncInterval = setTimeout(sync, backoff);
+        };
+        syncInterval = setTimeout(sync, backoff);
     },
     stop: () => {
-        if (syncInterval) clearInterval(syncInterval);
+        if (syncInterval) clearTimeout(syncInterval);
         syncInterval = null;
         sessionKey = null;
+        password = null;
         ui.updateSession(false);
         const url = new URL(location.href);
         url.searchParams.delete('s');
@@ -689,19 +707,12 @@ const actions = {
             await navigator.clipboard.writeText(location.href);
             ui.toast('Copied');
         } catch {
-            const t = document.createElement('textarea');
-            t.value = location.href;
-            t.style.cssText = 'position:fixed;opacity:0';
-            document.body.appendChild(t);
-            t.select();
-            document.execCommand('copy');
-            document.body.removeChild(t);
-            ui.toast('Copied');
+            ui.toast('Copy failed — use Ctrl+L then Ctrl+C');
         }
     },
     toggleEnc: () => {
         if (password) {
-            password = null;
+            password = null; // GC will reclaim; can't zero JS strings
             dom.encrypt_btn.textContent = 'ENCRYPT';
             dom.encrypt_btn.classList.remove('active');
             doc.save();
@@ -739,7 +750,11 @@ const init = async () => {
         await doc.load();
 
         // Event Listeners
-        dom.editor.addEventListener('input', () => { ui.updateAll(); doc.save(); });
+        dom.editor.addEventListener('input', () => {
+            ui.updateAll();
+            if (saveTimeout) clearTimeout(saveTimeout);
+            saveTimeout = setTimeout(() => doc.save(), 300);
+        });
         dom.editor.addEventListener('scroll', ui.syncScroll);
         dom.copy_btn.onclick = actions.copy;
         dom.clear_btn.onclick = doc.clear;
