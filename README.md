@@ -1,4 +1,4 @@
-# gitText - Shareable Text Editor
+# gitText - Shareable Text Editor (https://amiyamandal-dev.github.io/gitText/)
 
 A text editor where the entire document state is compressed and stored in the URL fragment. Share the URL to share the exact document state.
 
